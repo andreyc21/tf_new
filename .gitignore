@@ -1,2 +1,4 @@
 .env
 data
+debug_dump_*.json
+__pycache__
