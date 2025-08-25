@@ -1,4 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
 .env
-data
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Data files
+data/
+*.csv
+*.csv.gz
+
+# Debug dumps
 debug_dump_*.json
-__pycache__
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Kubernetes secrets (если содержат реальные данные)
+# k8s/secret.yaml

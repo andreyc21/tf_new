@@ -10,15 +10,132 @@ import logging
 import threading
 import requests
 import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from rsi_strategy import RSIStrategyBase
+from config import USE_CUSTOM_RSI, USE_DUAL_RSI
 
 # === ЛОГГЕР ===
-logging.basicConfig(
-    level=logging.INFO,  # Возвращаем INFO уровень
-    format='[%(asctime)s] %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
-logger = logging.getLogger("rsi-bot")
+def setup_logging():
+    """Настройка логирования в файл с ротацией"""
+    import logging.handlers
+    
+    # Создаем директорию для логов
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Основной логгер
+    logger = logging.getLogger("rsi-bot")
+    logger.setLevel(logging.INFO)
+    
+    # Очищаем существующие handlers
+    logger.handlers.clear()
+    
+    # Formatter
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Ротируемый файловый handler (100MB, 10 файлов)
+    file_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(log_dir, 'bybit_bot.log'),
+        maxBytes=100*1024*1024,  # 100MB
+        backupCount=10,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    
+    # Консольный handler (только для разработки)
+    if os.getenv('DEVELOPMENT', 'false').lower() == 'true':
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
+    # Отдельный файл для ошибок
+    error_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(log_dir, 'bybit_bot_errors.log'),
+        maxBytes=50*1024*1024,  # 50MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(error_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+# === HEALTH CHECK SERVER ===
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Отключаем стандартные логи HTTP сервера
+        pass
+    
+    def do_GET(self):
+        global global_bot_instance
+        
+        if self.path == '/health':
+            try:
+                # Проверяем состояние бота
+                if global_bot_instance and hasattr(global_bot_instance, 'ws') and global_bot_instance.ws:
+                    status = {
+                        'status': 'healthy',
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'connected': global_bot_instance.is_connected,
+                        'last_tick': global_bot_instance.last_tick_time.isoformat() if global_bot_instance.last_tick_time else None,
+                        'reconnect_attempts': global_bot_instance.reconnect_attempts,
+                        'equity': global_bot_instance.strategy.equity,
+                        'trades_count': len(global_bot_instance.strategy.trades)
+                    }
+                    self.send_response(200)
+                else:
+                    status = {
+                        'status': 'unhealthy',
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                        'error': 'Bot not initialized'
+                    }
+                    self.send_response(503)
+                
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(status, indent=2).encode())
+                
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                error_response = {
+                    'status': 'error',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'error': str(e)
+                }
+                self.wfile.write(json.dumps(error_response, indent=2).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def start_health_server():
+    """Запускает HTTP сервер для health check"""
+    try:
+        server = HTTPServer(('0.0.0.0', 8080), HealthCheckHandler)
+        server.timeout = 1  # Короткий таймаут для неблокирующей работы
+        
+        def serve_forever():
+            while True:
+                server.handle_request()
+        
+        health_thread = threading.Thread(target=serve_forever, daemon=True)
+        health_thread.start()
+        logger.info("🏥 Health check server запущен на порту 8080")
+        return server
+    except Exception as e:
+        logger.error(f"❌ Не удалось запустить health check server: {e}")
+        return None
 
 # === НАСТРОЙКИ ===
 API_KEY  = os.getenv("API_KEY")
@@ -448,12 +565,14 @@ class RSIBot:
         self.symbol = symbol
         self.position_size = position_size
         self.testnet = TESTNET  # Сохраняем настройку testnet
-        # Используем RSIStrategyBase вместо собственной реализации
+        # Используем RSIStrategyBase с конфигурируемой стратегией
         self.strategy = RSIStrategyBase(
             rsi_period=RSI_PERIOD,
             rsi_buy=RSI_BUY,
             rsi_sell=RSI_SELL,
-            candle_minutes=CANDLE_MINUTES
+            candle_minutes=CANDLE_MINUTES,
+            use_custom_rsi=USE_CUSTOM_RSI,  # 🏆 Конфигурируется в config.py
+            use_dual_rsi=USE_DUAL_RSI
         )
         self.position = 0  # 1 = long, -1 = short, 0 = flat
         self.last_signal = 0
@@ -870,6 +989,9 @@ class RSIBot:
 # === Основной запуск ===
 def main():
     global global_bot_instance
+    
+    # Запускаем health check сервер
+    health_server = start_health_server()
     
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGUSR1, signal_handler)  # kill -USR1 <pid>
