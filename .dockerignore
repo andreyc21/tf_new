@@ -1,0 +1,71 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+.coverage
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (будут создаваться в контейнере)
+logs/
+*.log
+
+# Data files (будут монтироваться как volumes)
+data/
+*.csv
+*.csv.gz
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Docker
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+
+# Kubernetes
+k8s-*.yaml
+
+# Scripts
+build.sh
+deploy-k8s.sh
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Development files
+test_*.py
+*_test.py
+benchmark_*.py
+compare_*.py
+strategy_optimizer.py
+backtester.py
+
+# Documentation
+README.md
+docs/
