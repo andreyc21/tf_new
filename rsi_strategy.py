@@ -96,9 +96,79 @@ def compute_bollinger_bands(prices, period=20, num_std=2):
         # Fallback к кастомной реализации
         return compute_bollinger_bands_custom(prices, period, num_std)
 
+# === ИНДИКАТОРЫ ВОЛАТИЛЬНОСТИ ===
+
+def compute_atr_custom(candles, period=14):
+    """Кастомная реализация Average True Range (ATR)"""
+    if len(candles) < 2:
+        return 0.0
+    
+    true_ranges = []
+    for i in range(1, len(candles)):
+        prev_candle = candles[i-1]
+        curr_candle = candles[i]
+        
+        # True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+        tr1 = curr_candle.high - curr_candle.low
+        tr2 = abs(curr_candle.high - prev_candle.close)
+        tr3 = abs(curr_candle.low - prev_candle.close)
+        
+        true_range = max(tr1, tr2, tr3)
+        true_ranges.append(true_range)
+    
+    # ATR = среднее значение True Range за период
+    if len(true_ranges) >= period:
+        return np.mean(true_ranges[-period:])
+    elif len(true_ranges) > 0:
+        return np.mean(true_ranges)
+    else:
+        return 0.0
+
+def compute_atr(candles, period=14):
+    """Стандартная реализация ATR (TA-Lib или fallback к кастомной)"""
+    if TALIB_AVAILABLE and len(candles) >= period:
+        try:
+            # Подготавливаем данные для TA-Lib
+            highs = np.array([c.high for c in candles], dtype=np.float64)
+            lows = np.array([c.low for c in candles], dtype=np.float64)
+            closes = np.array([c.close for c in candles], dtype=np.float64)
+            
+            if len(highs) >= period:
+                atr_values = talib.ATR(highs, lows, closes, timeperiod=period)
+                return atr_values[-1] if not np.isnan(atr_values[-1]) else 0.0
+            else:
+                return 0.0
+        except Exception:
+            # Fallback к кастомной реализации
+            return compute_atr_custom(candles, period)
+    else:
+        # Fallback к кастомной реализации
+        return compute_atr_custom(candles, period)
+
+def compute_volatility_ratio(candles, atr_period=14, lookback=50):
+    """Вычисление коэффициента волатильности (текущая ATR / средняя ATR)"""
+    if len(candles) < lookback:
+        return 1.0
+    
+    current_atr = compute_atr(candles, atr_period)
+    
+    # Вычисляем ATR для каждого периода в lookback окне
+    atr_values = []
+    for i in range(max(atr_period + 1, len(candles) - lookback), len(candles)):
+        atr_val = compute_atr(candles[:i+1], atr_period)
+        if atr_val > 0:
+            atr_values.append(atr_val)
+    
+    if len(atr_values) == 0 or current_atr == 0:
+        return 1.0
+    
+    avg_atr = np.mean(atr_values)
+    return current_atr / avg_atr if avg_atr > 0 else 1.0
+
 class RSIStrategyBase:
     def __init__(self, rsi_period=14, rsi_buy=30, rsi_sell=70, bb_period=20, bb_std=2, candle_minutes=5, 
-                 use_custom_rsi=True, use_dual_rsi=False):  # 🏆 По умолчанию используем выигрышную стратегию!
+                 use_custom_rsi=True, use_dual_rsi=False, use_neural_filter=False, 
+                 neural_confidence_threshold=0.6):  # 🏆 По умолчанию используем выигрышную стратегию!
         self.rsi_period = rsi_period
         self.rsi_buy = rsi_buy
         self.rsi_sell = rsi_sell
@@ -107,6 +177,8 @@ class RSIStrategyBase:
         self.candle_minutes = candle_minutes
         self.use_custom_rsi = use_custom_rsi  # Использовать только кастомный RSI
         self.use_dual_rsi = use_dual_rsi      # Использовать оба RSI для сигналов
+        self.use_neural_filter = use_neural_filter  # 🧠 Использовать нейронный фильтр
+        self.neural_confidence_threshold = neural_confidence_threshold
         
         self.position = 0  # 1 = long, -1 = short, 0 = flat
         self.last_price = None
@@ -118,6 +190,8 @@ class RSIStrategyBase:
         self.rsi_values = []           # Основной RSI (TA-Lib или кастомный)
         self.rsi_custom_values = []    # Кастомный RSI (если используется dual mode)
         self.bb_values = []
+        self.atr_values = []           # 📊 Значения ATR (волатильность)
+        self.volatility_ratios = []    # 📈 Коэффициенты волатильности
         
         self.entry_points = []  # (datetime, цена)
         self.exit_points = []   # (datetime, цена)
@@ -129,14 +203,28 @@ class RSIStrategyBase:
         self.cached_closes = []
         self.last_candle_count = 0
         
+        # 🧠 Нейронный фильтр
+        self.neural_filter = None
+        if use_neural_filter:
+            try:
+                from neural_filter import NeuralSignalFilter
+                self.neural_filter = NeuralSignalFilter()
+                print("🧠 Нейронный фильтр загружен")
+            except Exception as e:
+                print(f"⚠️ Не удалось загрузить нейронный фильтр: {e}")
+                self.use_neural_filter = False
+        
         # Информация о используемых индикаторах
+        neural_info = " + 🧠 Neural Filter" if use_neural_filter else ""
+        atr_type = "TA-Lib" if TALIB_AVAILABLE else "Custom"
+        
         if use_dual_rsi:
-            print(f"📊 🏆 Dual RSI Strategy: TA-Lib Wilder's + Custom SMA-based")
+            print(f"📊 🏆 Dual RSI Strategy: TA-Lib Wilder's + Custom SMA-based + {atr_type} ATR{neural_info}")
         elif use_custom_rsi:
-            print(f"📊 🏆 Optimized Strategy: Custom SMA-based RSI + TA-Lib Bollinger Bands")
+            print(f"📊 🏆 AI-Enhanced Strategy: Custom SMA-based RSI + TA-Lib Bollinger Bands + {atr_type} ATR{neural_info}")
         else:
             rsi_type = "TA-Lib Wilder's" if TALIB_AVAILABLE else "Custom SMA-based (fallback)"
-            print(f"📊 Standard Strategy: {rsi_type} RSI + TA-Lib Bollinger Bands")
+            print(f"📊 Standard Strategy: {rsi_type} RSI + TA-Lib Bollinger Bands + {atr_type} ATR{neural_info}")
 
     def dt_to_candle_start(self, dt):
         discard = timedelta(minutes=dt.minute % self.candle_minutes,
@@ -188,16 +276,24 @@ class RSIStrategyBase:
         # Bollinger Bands всегда через TA-Lib (если доступен) - быстрее и результат тот же
         ma, upper, lower = compute_bollinger_bands(closes_with_current, period=self.bb_period, num_std=self.bb_std)
         
+        # 📊 Вычисляем индикаторы волатильности
+        atr = compute_atr(self.candles + [self.current_candle], period=14)
+        volatility_ratio = compute_volatility_ratio(self.candles + [self.current_candle], atr_period=14, lookback=50)
+        
         # Сохраняем значения только при закрытии свечи
         if candle_closed:
             self.rsi_values.append(rsi)
             self.bb_values.append((ma, upper, lower))
+            self.atr_values.append(atr)
+            self.volatility_ratios.append(volatility_ratio)
             if self.use_dual_rsi:
                 self.rsi_custom_values.append(rsi_custom)
         elif len(self.rsi_values) == len(self.candles):
             # Для текущей свечи - обновляем последнее значение
             self.rsi_values.append(rsi)
             self.bb_values.append((ma, upper, lower))
+            self.atr_values.append(atr)
+            self.volatility_ratios.append(volatility_ratio)
             if self.use_dual_rsi:
                 self.rsi_custom_values.append(rsi_custom)
         # --- Сигналы ---
@@ -205,20 +301,46 @@ class RSIStrategyBase:
         candle_dt = self.current_candle.start_time
         candle_close = self.current_candle.close
         
-        # Логика для лонгов
-        if rsi < self.rsi_buy and self.position == 0:
+        # 🧠 Нейронная фильтрация сигналов
+        neural_approved = True
+        neural_confidence = 0.5
+        
+        if self.use_neural_filter and self.neural_filter and len(self.rsi_values) >= 20:
+            try:
+                # Подготавливаем признаки для нейронной сети
+                lookback = min(20, len(self.rsi_values))
+                recent_rsi = self.rsi_values[-lookback:]
+                recent_bb = self.bb_values[-lookback:]
+                recent_atr = self.atr_values[-lookback:]
+                recent_vol_ratio = self.volatility_ratios[-lookback:]
+                recent_prices = [c.close for c in self.candles[-lookback:]]
+                
+                features = self.neural_filter.prepare_features(
+                    recent_rsi, recent_bb, recent_atr, recent_vol_ratio, recent_prices
+                )
+                
+                if features is not None:
+                    neural_approved, neural_confidence = self.neural_filter.should_trade(
+                        features, self.neural_confidence_threshold
+                    )
+            except Exception as e:
+                print(f"⚠️ Ошибка нейронного фильтра: {e}")
+                neural_approved = True  # Fallback к обычной логике
+        
+        # Логика для лонгов (с нейронной фильтрацией)
+        if rsi < self.rsi_buy and self.position == 0 and neural_approved:
             signal = 1  # открыть лонг
             self.entry_points.append((candle_dt, candle_close))
         elif rsi > self.rsi_sell and self.position == 1:
-            signal = 0  # закрыть лонг
+            signal = 0  # закрыть лонг (выход без фильтрации)
             self.exit_points.append((candle_dt, candle_close))
             
-        # Логика для шортов
-        elif rsi > self.rsi_sell and self.position == 0:
+        # Логика для шортов (с нейронной фильтрацией)
+        elif rsi > self.rsi_sell and self.position == 0 and neural_approved:
             signal = -1  # открыть шорт
             self.entry_points.append((candle_dt, candle_close))
         elif rsi < self.rsi_buy and self.position == -1:
-            signal = 0  # закрыть шорт
+            signal = 0  # закрыть шорт (выход без фильтрации)
             self.exit_points.append((candle_dt, candle_close))
         # Управление позицией (эмулируем сделки для оффлайн-теста)
         if signal != self.position:
