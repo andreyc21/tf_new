@@ -12,7 +12,7 @@ import requests
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from rsi_strategy import RSIStrategyBase
-from config import USE_CUSTOM_RSI, USE_DUAL_RSI
+from config import USE_CUSTOM_RSI, USE_DUAL_RSI, USE_NEURAL_FILTER, NEURAL_CONFIDENCE_THRESHOLD
 
 # === ЛОГГЕР ===
 def setup_logging():
@@ -77,8 +77,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
     
     def do_GET(self):
-        global global_bot_instance
-        
         if self.path == '/health':
             try:
                 # Проверяем состояние бота
@@ -292,8 +290,6 @@ def create_debug_dump(bot_instance, signal_name="MANUAL"):
 
 def signal_handler(signum, frame):
     """Обработчик сигнала для создания дебаг-дампа"""
-    global global_bot_instance
-    
     signal_names = {
         signal.SIGUSR1: "SIGUSR1",  # Debug dump
         signal.SIGUSR2: "SIGUSR2",  # Force reconnect
@@ -565,14 +561,16 @@ class RSIBot:
         self.symbol = symbol
         self.position_size = position_size
         self.testnet = TESTNET  # Сохраняем настройку testnet
-        # Используем RSIStrategyBase с конфигурируемой стратегией
+        # Используем RSIStrategyBase с конфигурируемой AI-стратегией
         self.strategy = RSIStrategyBase(
             rsi_period=RSI_PERIOD,
             rsi_buy=RSI_BUY,
             rsi_sell=RSI_SELL,
             candle_minutes=CANDLE_MINUTES,
             use_custom_rsi=USE_CUSTOM_RSI,  # 🏆 Конфигурируется в config.py
-            use_dual_rsi=USE_DUAL_RSI
+            use_dual_rsi=USE_DUAL_RSI,
+            use_neural_filter=USE_NEURAL_FILTER,  # 🧠 AI-фильтр
+            neural_confidence_threshold=NEURAL_CONFIDENCE_THRESHOLD
         )
         self.position = 0  # 1 = long, -1 = short, 0 = flat
         self.last_signal = 0
