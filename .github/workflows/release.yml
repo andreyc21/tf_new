@@ -11,6 +11,7 @@ env:
 
 jobs:
   release:
+    if: false  # Временно отключено
     runs-on: ubuntu-latest
     permissions:
       contents: write
