@@ -35,5 +35,9 @@ RECONNECT_DELAY = 30
 MAX_RECONNECT_ATTEMPTS = 10
 
 # 🧠 Нейронная сеть (AI-фильтр)
-USE_NEURAL_FILTER = False        # True = использовать нейронный фильтр для сигналов
-NEURAL_CONFIDENCE_THRESHOLD = 0.6  # Минимальная уверенность для входа (0.0-1.0)
+USE_NEURAL_FILTER = True         # True = использовать нейронный фильтр для сигналов
+NEURAL_CONFIDENCE_THRESHOLD = 0.51  # Оптимальная уверенность для входа
+
+# Пути к свежей обученной модели (2025)
+NEURAL_MODEL_PATH = "models/neural_filter_2025.keras"
+NEURAL_SCALER_PATH = "models/scaler_2025.joblib"
