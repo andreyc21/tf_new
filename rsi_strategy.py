@@ -168,7 +168,8 @@ def compute_volatility_ratio(candles, atr_period=14, lookback=50):
 class RSIStrategyBase:
     def __init__(self, rsi_period=14, rsi_buy=30, rsi_sell=70, bb_period=20, bb_std=2, candle_minutes=5, 
                  use_custom_rsi=True, use_dual_rsi=False, use_neural_filter=False, 
-                 neural_confidence_threshold=0.6):  # 🏆 По умолчанию используем выигрышную стратегию!
+                 neural_confidence_threshold=0.6, limit_order_offset=0.0001, maker_fee=0.0001, 
+                 taker_fee=0.0005, use_bb_exit=False):  # 🏆 Реалистичные параметры для отложенных ордеров!
         self.rsi_period = rsi_period
         self.rsi_buy = rsi_buy
         self.rsi_sell = rsi_sell
@@ -179,12 +180,24 @@ class RSIStrategyBase:
         self.use_dual_rsi = use_dual_rsi      # Использовать оба RSI для сигналов
         self.use_neural_filter = use_neural_filter  # 🧠 Использовать нейронный фильтр
         self.neural_confidence_threshold = neural_confidence_threshold
+        self.use_bb_exit = use_bb_exit        # 🎯 Использовать выход по средней линии Боллинджера
+        
+        # 🏭 Реалистичные параметры торговли
+        self.limit_order_offset = limit_order_offset  # 0.01% отступ для лимитных ордеров
+        self.maker_fee = maker_fee      # 0.01% комиссия мейкера 
+        self.taker_fee = taker_fee      # 0.05% комиссия тейкера
         
         self.position = 0  # 1 = long, -1 = short, 0 = flat
+        self.last_signal = 0  # 🏭 Отслеживание предыдущего сигнала для избежания дублирования ордеров
         self.last_price = None
         self.candles = []
         self.current_candle = None
         self.current_candle_time = None
+        
+        # 📊 Отслеживание исполнения отложенных ордеров
+        self.pending_orders = []  # [(order_type, target_price, signal, timestamp)]
+        self.executed_orders = 0  # Количество исполненных ордеров
+        self.missed_orders = 0    # Количество неисполненных ордеров (цена не дошла)
         
         # Массивы для хранения значений индикаторов
         self.rsi_values = []           # Основной RSI (TA-Lib или кастомный)
@@ -232,7 +245,57 @@ class RSIStrategyBase:
                             microseconds=dt.microsecond)
         return dt - discard
 
+    def check_pending_orders(self, current_price, current_dt):
+        """🏭 Проверяем исполнение отложенных ордеров"""
+        executed_orders = []
+        
+        for i, (order_type, target_price, signal, timestamp) in enumerate(self.pending_orders):
+            # Проверяем, достигла ли цена уровня исполнения
+            order_executed = False
+            
+            if order_type == "buy_limit" and current_price <= target_price:
+                # Лимитный ордер на покупку исполняется, когда цена опускается до уровня или ниже
+                order_executed = True
+            elif order_type == "sell_limit" and current_price >= target_price:
+                # Лимитный ордер на продажу исполняется, когда цена поднимается до уровня или выше
+                order_executed = True
+            
+            if order_executed:
+                executed_orders.append(i)
+                self.executed_orders += 1
+                
+                # Исполняем сделку
+                if self.position == 1 and signal == 0:
+                    # Закрываем лонг
+                    pnl_before_fees = (target_price - self.last_price) / self.last_price
+                    net_pnl = pnl_before_fees - self.maker_fee
+                    self.equity *= (1 + net_pnl)
+                    self.trades.append(self.equity)
+                    
+                elif self.position == -1 and signal == 0:
+                    # Закрываем шорт
+                    pnl_before_fees = (self.last_price - target_price) / self.last_price
+                    net_pnl = pnl_before_fees - self.maker_fee
+                    self.equity *= (1 + net_pnl)
+                    self.trades.append(self.equity)
+                
+                elif signal == 1:
+                    # Открываем лонг
+                    self.last_price = target_price
+                elif signal == -1:
+                    # Открываем шорт
+                    self.last_price = target_price
+                
+                self.position = signal
+        
+        # Удаляем исполненные ордера (в обратном порядке, чтобы не сбить индексы)
+        for i in reversed(executed_orders):
+            del self.pending_orders[i]
+    
     def on_tick(self, price, dt, volume=0):
+        # 🏭 Проверяем исполнение отложенных ордеров
+        self.check_pending_orders(price, dt)
+        
         # --- Свечи ---
         candle_time = self.dt_to_candle_start(dt)
         candle_closed = False
@@ -331,36 +394,69 @@ class RSIStrategyBase:
         if rsi < self.rsi_buy and self.position == 0 and neural_approved:
             signal = 1  # открыть лонг
             self.entry_points.append((candle_dt, candle_close))
-        elif rsi > self.rsi_sell and self.position == 1:
-            signal = 0  # закрыть лонг (выход без фильтрации)
-            self.exit_points.append((candle_dt, candle_close))
+        elif self.position == 1:
+            # 🎯 Выбор условия выхода из лонга
+            if self.use_bb_exit:
+                # Выход по средней линии Боллинджера
+                if len(self.bb_values) > 0:
+                    bb_ma, bb_upper, bb_lower = self.bb_values[-1]
+                    if bb_ma is not None and candle_close <= bb_ma:
+                        signal = 0  # закрыть лонг
+                        self.exit_points.append((candle_dt, candle_close))
+            else:
+                # Стандартный выход по RSI
+                if rsi > self.rsi_sell:
+                    signal = 0  # закрыть лонг
+                    self.exit_points.append((candle_dt, candle_close))
             
         # Логика для шортов (с нейронной фильтрацией)
         elif rsi > self.rsi_sell and self.position == 0 and neural_approved:
             signal = -1  # открыть шорт
             self.entry_points.append((candle_dt, candle_close))
-        elif rsi < self.rsi_buy and self.position == -1:
-            signal = 0  # закрыть шорт (выход без фильтрации)
-            self.exit_points.append((candle_dt, candle_close))
-        # Управление позицией (эмулируем сделки для оффлайн-теста)
-        if signal != self.position:
-            # Закрываем предыдущую позицию и считаем PnL
-            if self.position == 1 and self.last_price is not None:
-                # Закрываем лонг
-                pnl = (price - self.last_price) / self.last_price
-                self.equity *= (1 + pnl)
-                self.trades.append(self.equity)
-            elif self.position == -1 and self.last_price is not None:
-                # Закрываем шорт (обратный расчет PnL)
-                pnl = (self.last_price - price) / self.last_price
-                self.equity *= (1 + pnl)
-                self.trades.append(self.equity)
+        elif self.position == -1:
+            # 🎯 Выбор условия выхода из шорта
+            if self.use_bb_exit:
+                # Выход по средней линии Боллинджера
+                if len(self.bb_values) > 0:
+                    bb_ma, bb_upper, bb_lower = self.bb_values[-1]
+                    if bb_ma is not None and candle_close >= bb_ma:
+                        signal = 0  # закрыть шорт
+                        self.exit_points.append((candle_dt, candle_close))
+            else:
+                # Стандартный выход по RSI
+                if rsi < self.rsi_buy:
+                    signal = 0  # закрыть шорт
+                    self.exit_points.append((candle_dt, candle_close))
+        # 🏭 Создаем отложенные ордера ТОЛЬКО при изменении сигнала
+        if signal != self.position and signal != self.last_signal:
+            # Отменяем старые отложенные ордера (если есть)
+            if self.pending_orders:
+                self.missed_orders += len(self.pending_orders)
+                self.pending_orders.clear()
             
-            # Открываем новую позицию
-            if signal == 1 or signal == -1:
-                self.last_price = price
+            # Создаем новый отложенный ордер
+            if signal == 1 and self.position == 0:
+                # Открываем лонг: ставим лимитный ордер на покупку ниже рынка
+                target_price = price * (1 - self.limit_order_offset)
+                self.pending_orders.append(("buy_limit", target_price, signal, dt))
+                
+            elif signal == -1 and self.position == 0:
+                # Открываем шорт: ставим лимитный ордер на продажу выше рынка
+                target_price = price * (1 + self.limit_order_offset)
+                self.pending_orders.append(("sell_limit", target_price, signal, dt))
+                
+            elif signal == 0 and self.position == 1:
+                # Закрываем лонг: ставим лимитный ордер на продажу выше рынка
+                target_price = price * (1 + self.limit_order_offset)
+                self.pending_orders.append(("sell_limit", target_price, signal, dt))
+                
+            elif signal == 0 and self.position == -1:
+                # Закрываем шорт: ставим лимитный ордер на покупку ниже рынка
+                target_price = price * (1 - self.limit_order_offset)
+                self.pending_orders.append(("buy_limit", target_price, signal, dt))
             
-            self.position = signal
+            # Обновляем последний сигнал
+            self.last_signal = signal
         # Сохраняем equity только при закрытии свечи
         if candle_closed:
             self.equity_curve.append(self.equity)
@@ -372,6 +468,11 @@ class RSIStrategyBase:
         return signal
 
     def on_finish(self, price):
+        # 🏭 Отменяем все неисполненные отложенные ордера
+        if self.pending_orders:
+            self.missed_orders += len(self.pending_orders)
+            self.pending_orders.clear()
+            
         if self.current_candle is not None:
             self.candles.append(self.current_candle)
             
@@ -422,4 +523,33 @@ class RSIStrategyBase:
         returns = np.diff(self.trades)
         if len(returns) == 0:
             return 0.0
-        return np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252) 
+        return np.mean(returns) / (np.std(returns) + 1e-8) * np.sqrt(252)
+    
+    def get_realistic_stats(self):
+        """📊 Получить реалистичную статистику с учетом комиссий и отступов"""
+        total_orders = self.executed_orders + self.missed_orders
+        execution_rate = (self.executed_orders / total_orders * 100) if total_orders > 0 else 0
+        
+        stats = {
+            'total_trades': len(self.trades),
+            'final_equity': self.equity,
+            'total_return_pct': (self.equity - 1.0) * 100,
+            'sharpe_ratio': self.sharpe(),
+            'limit_order_offset_pct': self.limit_order_offset * 100,
+            'maker_fee_pct': self.maker_fee * 100,
+            'taker_fee_pct': self.taker_fee * 100,
+            
+            # 🏭 Статистика исполнения отложенных ордеров
+            'total_orders': total_orders,
+            'executed_orders': self.executed_orders,
+            'missed_orders': self.missed_orders,
+            'execution_rate_pct': execution_rate,
+        }
+        
+        if len(self.trades) > 0:
+            # Оценка общих расходов на комиссии
+            total_fees = len(self.trades) * self.maker_fee * 2  # Вход + выход
+            stats['total_fees_pct'] = total_fees * 100
+            stats['avg_fee_per_trade_pct'] = (total_fees / len(self.trades)) * 100
+        
+        return stats 

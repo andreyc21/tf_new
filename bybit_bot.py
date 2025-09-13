@@ -911,7 +911,7 @@ class RSIBot:
         logger.info(f"[TRADE] {datetime.fromtimestamp(time.time(), timezone.utc)} Signal: {signal}, Price: {price}")
         try:
             order_link_id = f"rsi-bot-{uuid.uuid4()}"
-            offset = 0.001  # 0.1%
+            offset = 0.0001  # 0.01%
             # Закрыть противоположную позицию лимитным ордером
             if self.position == 1 and signal == -1:
                 limit_price = round(price * (1 + offset), 2)

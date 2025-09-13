@@ -26,14 +26,30 @@ def run_backtest_on_file(filename, strategy_params=None, plot=True, verbose=True
         strategy.on_finish(price)
     
     if verbose:
+        # 📊 Реалистичная статистика с учетом комиссий
+        stats = strategy.get_realistic_stats()
+        
         print(f'Файл: {filename}')
-        print(f'Sharpe: {strategy.sharpe():.4f}')
-        print(f'Equity: {strategy.equity:.4f}')
-        print(f'Сделок: {len(strategy.trades)}')
-        print(f'Свечей: {len(strategy.candles)}')
-        print(f'Тиков: {tick_count}')
-        print(f'Входов: {len(strategy.entry_points)}')
-        print(f'Выходов: {len(strategy.exit_points)}')
+        print(f'🏭 РЕАЛИСТИЧНЫЙ БЭКТЕСТ (с отложенными ордерами):')
+        print(f'  📈 Sharpe: {stats["sharpe_ratio"]:.4f}')
+        print(f'  💰 Equity: {stats["final_equity"]:.4f} ({stats["total_return_pct"]:+.2f}%)')
+        print(f'  🔄 Сделок: {stats["total_trades"]}')
+        print(f'  📊 Свечей: {len(strategy.candles)}')
+        print(f'  ⚡ Тиков: {tick_count}')
+        print(f'  🎯 Входов: {len(strategy.entry_points)}')
+        print(f'  🚪 Выходов: {len(strategy.exit_points)}')
+        print(f'  💸 Отступ лимитных ордеров: {stats["limit_order_offset_pct"]:.3f}%')
+        print(f'  💳 Комиссия мейкера: {stats["maker_fee_pct"]:.3f}%')
+        
+        # 🏭 Статистика исполнения отложенных ордеров
+        print(f'  📋 Всего отложенных ордеров: {stats["total_orders"]}')
+        print(f'  ✅ Исполнено ордеров: {stats["executed_orders"]}')
+        print(f'  ❌ Цена не дошла: {stats["missed_orders"]}')
+        print(f'  📊 Процент исполнения: {stats["execution_rate_pct"]:.1f}%')
+        
+        if stats["total_trades"] > 0:
+            print(f'  🧾 Общие комиссии: {stats["total_fees_pct"]:.3f}%')
+            print(f'  📝 Средняя комиссия за сделку: {stats["avg_fee_per_trade_pct"]:.3f}%')
         
     if plot:
         plot_strategy(strategy)
@@ -121,16 +137,24 @@ def run_multiple_backtests(pattern="data/BTCUSDT_2024-07-*.csv.gz", max_files=10
         print(f"\n[{i}/{len(files)}] {os.path.basename(filename)}")
         try:
             strategy = run_backtest_on_file(filename, strategy_params, plot=False, verbose=False)
+            stats = strategy.get_realistic_stats()  # 🏭 Реалистичная статистика
             
             result = {
                 'filename': filename,
-                'sharpe': strategy.sharpe(),
-                'equity': strategy.equity,
-                'trades_count': len(strategy.trades),
+                'sharpe': stats['sharpe_ratio'],
+                'equity': stats['final_equity'],
+                'trades_count': stats['total_trades'],
                 'candles_count': len(strategy.candles),
                 'entry_points': len(strategy.entry_points),
                 'exit_points': len(strategy.exit_points),
-                'pnl_percent': (strategy.equity - 1.0) * 100
+                'pnl_percent': stats['total_return_pct'],
+                'total_fees_pct': stats.get('total_fees_pct', 0),
+                'limit_offset_pct': stats['limit_order_offset_pct'],
+                'maker_fee_pct': stats['maker_fee_pct'],
+                'total_orders': stats['total_orders'],
+                'executed_orders': stats['executed_orders'],
+                'missed_orders': stats['missed_orders'],
+                'execution_rate_pct': stats['execution_rate_pct']
             }
             
             # Кумулятивная доходность
@@ -142,6 +166,8 @@ def run_multiple_backtests(pattern="data/BTCUSDT_2024-07-*.csv.gz", max_files=10
             print(f"  📈 Sharpe: {result['sharpe']:8.4f}")
             print(f"  💰 Equity: {result['equity']:8.4f} ({result['pnl_percent']:+6.2f}%)")
             print(f"  🔄 Сделок: {result['trades_count']:3d}")
+            print(f"  💸 Комиссии: {result['total_fees_pct']:5.2f}%")
+            print(f"  📋 Ордеров: {result['executed_orders']}/{result['total_orders']} ({result['execution_rate_pct']:.0f}%)")
             print(f"  📊 Кумул.: {result['cumulative_equity']:8.4f}")
             
         except Exception as e:
@@ -152,12 +178,24 @@ def run_multiple_backtests(pattern="data/BTCUSDT_2024-07-*.csv.gz", max_files=10
     successful_results = [r for r in results if 'error' not in r]
     if successful_results:
         print("\n" + "=" * 80)
-        print("📊 ИТОГОВАЯ СТАТИСТИКА:")
+        print("📊 ИТОГОВАЯ СТАТИСТИКА (РЕАЛИСТИЧНЫЙ БЭКТЕСТ):")
         print(f"Успешных тестов: {len(successful_results)}/{len(results)}")
+        
+        # Показываем параметры торговли
+        if successful_results:
+            first_result = successful_results[0]
+            print(f"🏭 Параметры торговли:")
+            print(f"  💸 Отступ лимитных ордеров: {first_result['limit_offset_pct']:.3f}%")
+            print(f"  💳 Комиссия мейкера: {first_result['maker_fee_pct']:.3f}%")
         
         sharpe_values = [r['sharpe'] for r in successful_results]
         equity_values = [r['equity'] for r in successful_results]
         pnl_values = [r['pnl_percent'] for r in successful_results]
+        fees_values = [r['total_fees_pct'] for r in successful_results]
+        execution_rates = [r['execution_rate_pct'] for r in successful_results]
+        total_orders_sum = sum([r['total_orders'] for r in successful_results])
+        executed_orders_sum = sum([r['executed_orders'] for r in successful_results])
+        missed_orders_sum = sum([r['missed_orders'] for r in successful_results])
         
         print(f"Средний Sharpe: {sum(sharpe_values)/len(sharpe_values):8.4f}")
         print(f"Медианный Sharpe: {sorted(sharpe_values)[len(sharpe_values)//2]:8.4f}")
@@ -169,6 +207,23 @@ def run_multiple_backtests(pattern="data/BTCUSDT_2024-07-*.csv.gz", max_files=10
         
         profitable_days = len([p for p in pnl_values if p > 0])
         print(f"Прибыльных дней: {profitable_days}/{len(pnl_values)} ({profitable_days/len(pnl_values)*100:.1f}%)")
+        
+        # Статистика по комиссиям
+        if fees_values:
+            avg_fees = sum(fees_values) / len(fees_values)
+            total_fees = sum(fees_values)
+            print(f"Средние комиссии за день: {avg_fees:.3f}%")
+            print(f"Общие комиссии за период: {total_fees:.3f}%")
+        
+        # 🏭 Статистика исполнения отложенных ордеров
+        if total_orders_sum > 0:
+            overall_execution_rate = (executed_orders_sum / total_orders_sum) * 100
+            avg_execution_rate = sum(execution_rates) / len(execution_rates)
+            print(f"📋 Всего отложенных ордеров: {total_orders_sum}")
+            print(f"✅ Исполнено ордеров: {executed_orders_sum}")
+            print(f"❌ Цена не дошла: {missed_orders_sum}")
+            print(f"📊 Общий процент исполнения: {overall_execution_rate:.1f}%")
+            print(f"📊 Средний процент исполнения: {avg_execution_rate:.1f}%")
         
         total_return = (total_equity - 1.0) * 100
         print(f"Итоговая кумулятивная доходность: {total_return:+6.2f}%")
