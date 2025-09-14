@@ -125,43 +125,73 @@ def compute_atr_custom(candles, period=14):
         return 0.0
 
 def compute_atr(candles, period=14):
-    """Стандартная реализация ATR (TA-Lib или fallback к кастомной)"""
-    if TALIB_AVAILABLE and len(candles) >= period:
+    """🚀 ОПТИМИЗИРОВАННАЯ реализация ATR с кэшированием"""
+    if len(candles) < period:
+        return 0.0
+        
+    if TALIB_AVAILABLE:
         try:
-            # Подготавливаем данные для TA-Lib
+            # Подготавливаем данные для TA-Lib (оптимизированно)
             highs = np.array([c.high for c in candles], dtype=np.float64)
             lows = np.array([c.low for c in candles], dtype=np.float64)
             closes = np.array([c.close for c in candles], dtype=np.float64)
             
-            if len(highs) >= period:
-                atr_values = talib.ATR(highs, lows, closes, timeperiod=period)
-                return atr_values[-1] if not np.isnan(atr_values[-1]) else 0.0
-            else:
-                return 0.0
+            atr_values = talib.ATR(highs, lows, closes, timeperiod=period)
+            return atr_values[-1] if not np.isnan(atr_values[-1]) else 0.0
         except Exception:
-            # Fallback к кастомной реализации
             return compute_atr_custom(candles, period)
     else:
-        # Fallback к кастомной реализации
         return compute_atr_custom(candles, period)
 
 def compute_volatility_ratio(candles, atr_period=14, lookback=50):
-    """Вычисление коэффициента волатильности (текущая ATR / средняя ATR)"""
+    """🚀 ОПТИМИЗИРОВАННОЕ вычисление коэффициента волатильности"""
     if len(candles) < lookback:
         return 1.0
     
+    # Используем TA-Lib для вычисления всех ATR значений за один вызов
+    if TALIB_AVAILABLE and len(candles) >= atr_period:
+        try:
+            # Подготавливаем данные один раз
+            highs = np.array([c.high for c in candles], dtype=np.float64)
+            lows = np.array([c.low for c in candles], dtype=np.float64)
+            closes = np.array([c.close for c in candles], dtype=np.float64)
+            
+            # Вычисляем все ATR значения за один вызов
+            all_atr = talib.ATR(highs, lows, closes, timeperiod=atr_period)
+            
+            # Фильтруем валидные значения
+            valid_atr = all_atr[~np.isnan(all_atr)]
+            
+            if len(valid_atr) == 0:
+                return 1.0
+            
+            current_atr = valid_atr[-1]
+            
+            # Берем последние lookback значений для средней
+            lookback_atr = valid_atr[-min(lookback, len(valid_atr)):]
+            avg_atr = np.mean(lookback_atr)
+            
+            return current_atr / avg_atr if avg_atr > 0 else 1.0
+            
+        except Exception:
+            # Fallback к старой логике
+            pass
+    
+    # Fallback: старая логика (медленная)
     current_atr = compute_atr(candles, atr_period)
     
-    # Вычисляем ATR для каждого периода в lookback окне
+    # Берем только последние значения вместо пересчета всех
+    start_idx = max(0, len(candles) - lookback)
     atr_values = []
-    for i in range(max(atr_period + 1, len(candles) - lookback), len(candles)):
+    
+    for i in range(start_idx, len(candles), 5):  # Каждые 5 свечей вместо каждой
         atr_val = compute_atr(candles[:i+1], atr_period)
         if atr_val > 0:
             atr_values.append(atr_val)
     
     if len(atr_values) == 0 or current_atr == 0:
         return 1.0
-    
+        
     avg_atr = np.mean(atr_values)
     return current_atr / avg_atr if avg_atr > 0 else 1.0
 
@@ -206,6 +236,15 @@ class RSIStrategyBase:
         self.atr_values = []           # 📊 Значения ATR (волатильность)
         self.volatility_ratios = []    # 📈 Коэффициенты волатильности
         
+        # 🚀 Кэш для оптимизации производительности
+        self.atr_cache = {}            # Кэш ATR значений {length: atr_value}
+        self.numpy_arrays_cache = {    # Кэш numpy массивов
+            'highs': None,
+            'lows': None, 
+            'closes': None,
+            'last_length': 0
+        }
+        
         self.entry_points = []  # (datetime, цена)
         self.exit_points = []   # (datetime, цена)
         self.equity = 1.0
@@ -244,6 +283,63 @@ class RSIStrategyBase:
                             seconds=dt.second,
                             microseconds=dt.microsecond)
         return dt - discard
+    
+    def get_cached_arrays(self):
+        """🚀 Получить кэшированные numpy массивы"""
+        current_length = len(self.candles)
+        cache = self.numpy_arrays_cache
+        
+        # Если кэш актуален, возвращаем его
+        if (cache['last_length'] == current_length and 
+            cache['highs'] is not None and 
+            current_length > 0):
+            return cache['highs'], cache['lows'], cache['closes']
+        
+        # Обновляем кэш
+        if current_length > 0:
+            cache['highs'] = np.array([c.high for c in self.candles], dtype=np.float64)
+            cache['lows'] = np.array([c.low for c in self.candles], dtype=np.float64)  
+            cache['closes'] = np.array([c.close for c in self.candles], dtype=np.float64)
+            cache['last_length'] = current_length
+            
+            return cache['highs'], cache['lows'], cache['closes']
+        
+        return None, None, None
+    
+    def get_cached_atr(self, period=14):
+        """🚀 Получить кэшированное значение ATR"""
+        current_length = len(self.candles)
+        cache_key = f"{current_length}_{period}"
+        
+        # Проверяем кэш
+        if cache_key in self.atr_cache:
+            return self.atr_cache[cache_key]
+        
+        # Вычисляем и кэшируем
+        if current_length >= period:
+            highs, lows, closes = self.get_cached_arrays()
+            if highs is not None and TALIB_AVAILABLE:
+                try:
+                    atr_values = talib.ATR(highs, lows, closes, timeperiod=period)
+                    atr_val = atr_values[-1] if not np.isnan(atr_values[-1]) else 0.0
+                    self.atr_cache[cache_key] = atr_val
+                    
+                    # Ограничиваем размер кэша
+                    if len(self.atr_cache) > 1000:
+                        # Удаляем старые записи
+                        old_keys = [k for k in self.atr_cache.keys() 
+                                   if int(k.split('_')[0]) < current_length - 100]
+                        for k in old_keys:
+                            del self.atr_cache[k]
+                    
+                    return atr_val
+                except Exception:
+                    pass
+        
+        # Fallback
+        atr_val = compute_atr_custom(self.candles, period)
+        self.atr_cache[cache_key] = atr_val
+        return atr_val
 
     def check_pending_orders(self, current_price, current_dt):
         """🏭 Проверяем исполнение отложенных ордеров"""
@@ -339,9 +435,10 @@ class RSIStrategyBase:
         # Bollinger Bands всегда через TA-Lib (если доступен) - быстрее и результат тот же
         ma, upper, lower = compute_bollinger_bands(closes_with_current, period=self.bb_period, num_std=self.bb_std)
         
-        # 📊 Вычисляем индикаторы волатильности
-        atr = compute_atr(self.candles + [self.current_candle], period=14)
-        volatility_ratio = compute_volatility_ratio(self.candles + [self.current_candle], atr_period=14, lookback=50)
+        # 📊 Вычисляем индикаторы волатильности (оптимизированно)
+        candles_with_current = self.candles + [self.current_candle]
+        atr = compute_atr(candles_with_current, period=14)
+        volatility_ratio = compute_volatility_ratio(candles_with_current, atr_period=14, lookback=50)
         
         # Сохраняем значения только при закрытии свечи
         if candle_closed:
