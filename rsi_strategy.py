@@ -199,7 +199,7 @@ class RSIStrategyBase:
     def __init__(self, rsi_period=14, rsi_buy=30, rsi_sell=70, bb_period=20, bb_std=2, candle_minutes=5, 
                  use_custom_rsi=True, use_dual_rsi=False, use_neural_filter=False, 
                  neural_confidence_threshold=0.6, limit_order_offset=0.0001, maker_fee=0.0001, 
-                 taker_fee=0.0005, use_bb_exit=False):  # 🏆 Реалистичные параметры для отложенных ордеров!
+                 taker_fee=0.0005, use_bb_exit=False, use_support_resistance=False):  # 🏆 Реалистичные параметры для отложенных ордеров!
         self.rsi_period = rsi_period
         self.rsi_buy = rsi_buy
         self.rsi_sell = rsi_sell
@@ -211,6 +211,7 @@ class RSIStrategyBase:
         self.use_neural_filter = use_neural_filter  # 🧠 Использовать нейронный фильтр
         self.neural_confidence_threshold = neural_confidence_threshold
         self.use_bb_exit = use_bb_exit        # 🎯 Использовать выход по средней линии Боллинджера
+        self.use_support_resistance = use_support_resistance  # 📊 Использовать уровни S&R
         
         # 🏭 Реалистичные параметры торговли
         self.limit_order_offset = limit_order_offset  # 0.01% отступ для лимитных ордеров
@@ -244,6 +245,12 @@ class RSIStrategyBase:
             'closes': None,
             'last_length': 0
         }
+        
+        # 📊 Уровни поддержки и сопротивления
+        self.use_support_resistance = False  # Флаг использования S&R
+        self.sr_levels = []                  # Текущие уровни S&R
+        self.sr_last_update = 0              # Последнее обновление S&R
+        self.sr_update_interval = 20        # Обновлять каждые N свечей
         
         self.entry_points = []  # (datetime, цена)
         self.exit_points = []   # (datetime, цена)
@@ -340,6 +347,86 @@ class RSIStrategyBase:
         atr_val = compute_atr_custom(self.candles, period)
         self.atr_cache[cache_key] = atr_val
         return atr_val
+    
+    def update_support_resistance_levels(self):
+        """📊 Обновление уровней поддержки и сопротивления"""
+        if not self.use_support_resistance:
+            return
+            
+        current_candle_count = len(self.candles)
+        
+        # Обновляем только периодически для производительности
+        if (current_candle_count - self.sr_last_update >= self.sr_update_interval or 
+            (len(self.sr_levels) == 0 and current_candle_count >= 50)):
+            try:
+                from support_resistance import SupportResistanceFinder
+                
+                sr_finder = SupportResistanceFinder(
+                    min_touches=2, 
+                    tolerance_pct=0.3,   # Увеличиваем допуск для крипты
+                    lookback=min(200, current_candle_count),
+                    min_strength=0.1     # Снижаем минимальную силу
+                )
+                
+                self.sr_levels = sr_finder.find_support_resistance_levels(self.candles)
+                self.sr_last_update = current_candle_count
+                
+            except ImportError:
+                # Если модуль недоступен, отключаем S&R
+                self.use_support_resistance = False
+    
+    def get_sr_signal_modifier(self, signal, current_price):
+        """🎯 Модификация сигналов на основе уровней S&R"""
+        if not self.use_support_resistance or not self.sr_levels:
+            return signal, 1.0  # Без изменений
+        
+        from support_resistance import SupportResistanceFinder
+        
+        sr_finder = SupportResistanceFinder()
+        nearest = sr_finder.get_nearest_levels(self.sr_levels, current_price, max_distance_pct=2.0)
+        
+        signal_strength = 1.0
+        
+        # Логика модификации сигналов
+        if signal == 1:  # Сигнал на покупку
+            # Усиливаем сигнал рядом с поддержкой
+            if nearest['support'] and nearest['support'].strength > 0.5:
+                distance_pct = abs(current_price - nearest['support'].price) / current_price * 100
+                if distance_pct < 0.5:  # Очень близко к поддержке
+                    signal_strength = 1.5
+                elif distance_pct < 1.0:
+                    signal_strength = 1.2
+            
+            # Ослабляем сигнал рядом с сопротивлением
+            if nearest['resistance'] and nearest['resistance'].strength > 0.5:
+                distance_pct = abs(nearest['resistance'].price - current_price) / current_price * 100
+                if distance_pct < 0.5:  # Очень близко к сопротивлению
+                    signal_strength = 0.3  # Сильно ослабляем
+                elif distance_pct < 1.0:
+                    signal_strength = 0.7
+        
+        elif signal == -1:  # Сигнал на продажу
+            # Усиливаем сигнал рядом с сопротивлением
+            if nearest['resistance'] and nearest['resistance'].strength > 0.5:
+                distance_pct = abs(nearest['resistance'].price - current_price) / current_price * 100
+                if distance_pct < 0.5:
+                    signal_strength = 1.5
+                elif distance_pct < 1.0:
+                    signal_strength = 1.2
+            
+            # Ослабляем сигнал рядом с поддержкой
+            if nearest['support'] and nearest['support'].strength > 0.5:
+                distance_pct = abs(current_price - nearest['support'].price) / current_price * 100
+                if distance_pct < 0.5:
+                    signal_strength = 0.3
+                elif distance_pct < 1.0:
+                    signal_strength = 0.7
+        
+        # Применяем модификацию: если сила < 0.5, блокируем сигнал
+        if signal_strength < 0.5:
+            return self.position, signal_strength  # Оставляем текущую позицию
+        
+        return signal, signal_strength
 
     def check_pending_orders(self, current_price, current_dt):
         """🏭 Проверяем исполнение отложенных ордеров"""
@@ -456,6 +543,10 @@ class RSIStrategyBase:
             self.volatility_ratios.append(volatility_ratio)
             if self.use_dual_rsi:
                 self.rsi_custom_values.append(rsi_custom)
+        # 📊 Обновляем уровни поддержки и сопротивления
+        if candle_closed:
+            self.update_support_resistance_levels()
+        
         # --- Сигналы ---
         signal = self.position
         candle_dt = self.current_candle.start_time
@@ -524,6 +615,11 @@ class RSIStrategyBase:
                 if rsi < self.rsi_buy:
                     signal = 0  # закрыть шорт
                     self.exit_points.append((candle_dt, candle_close))
+        
+        # 📊 Применяем модификацию сигналов на основе S&R
+        if self.use_support_resistance and signal != self.position:
+            signal, sr_strength = self.get_sr_signal_modifier(signal, price)
+        
         # 🏭 Создаем отложенные ордера ТОЛЬКО при изменении сигнала
         if signal != self.position and signal != self.last_signal:
             # Отменяем старые отложенные ордера (если есть)
