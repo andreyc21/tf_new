@@ -199,7 +199,9 @@ class RSIStrategyBase:
     def __init__(self, rsi_period=14, rsi_buy=30, rsi_sell=70, bb_period=20, bb_std=2, candle_minutes=5, 
                  use_custom_rsi=True, use_dual_rsi=False, use_neural_filter=False, 
                  neural_confidence_threshold=0.6, limit_order_offset=0.0001, maker_fee=0.0001, 
-                 taker_fee=0.0005, use_bb_exit=False, use_support_resistance=False):  # 🏆 Реалистичные параметры для отложенных ордеров!
+                 taker_fee=0.0005, use_bb_exit=False, use_support_resistance=False,
+                 use_stop_loss=True, stop_loss_pct=0.02, use_trailing_stop=True, 
+                 trailing_stop_pct=0.015, use_atr_stop=True, atr_multiplier=2.0):  # 🏆 Реалистичные параметры для отложенных ордеров!
         self.rsi_period = rsi_period
         self.rsi_buy = rsi_buy
         self.rsi_sell = rsi_sell
@@ -218,6 +220,14 @@ class RSIStrategyBase:
         self.maker_fee = maker_fee      # 0.01% комиссия мейкера 
         self.taker_fee = taker_fee      # 0.05% комиссия тейкера
         
+        # 🛡️ Параметры стоп-лоссов
+        self.use_stop_loss = use_stop_loss           # Использовать стоп-лоссы
+        self.stop_loss_pct = stop_loss_pct           # Процент стоп-лосса
+        self.use_trailing_stop = use_trailing_stop   # Трейлинг стоп
+        self.trailing_stop_pct = trailing_stop_pct   # Процент трейлинг стопа
+        self.use_atr_stop = use_atr_stop             # Адаптивный стоп на основе ATR
+        self.atr_multiplier = atr_multiplier         # Множитель ATR для стоп-лосса
+        
         self.position = 0  # 1 = long, -1 = short, 0 = flat
         self.last_signal = 0  # 🏭 Отслеживание предыдущего сигнала для избежания дублирования ордеров
         self.last_price = None
@@ -229,6 +239,13 @@ class RSIStrategyBase:
         self.pending_orders = []  # [(order_type, target_price, signal, timestamp)]
         self.executed_orders = 0  # Количество исполненных ордеров
         self.missed_orders = 0    # Количество неисполненных ордеров (цена не дошла)
+        
+        # 🛡️ Стоп-лоссы
+        self.entry_price = None         # Цена входа в позицию
+        self.stop_loss_price = None     # Цена стоп-лосса
+        self.trailing_high = None       # Максимум для трейлинг стопа (лонг)
+        self.trailing_low = None        # Минимум для трейлинг стопа (шорт)
+        self.stop_loss_triggered = 0    # Счетчик сработавших стоп-лоссов
         
         # Массивы для хранения значений индикаторов
         self.rsi_values = []           # Основной RSI (TA-Lib или кастомный)
@@ -272,6 +289,10 @@ class RSIStrategyBase:
             except Exception as e:
                 print(f"⚠️ Не удалось загрузить нейронный фильтр: {e}")
                 self.use_neural_filter = False
+        
+        # 📚 Сбор данных для обучения
+        self.training_data_collector = None
+        self.collect_training_data = False
         
         # Информация о используемых индикаторах
         neural_info = " + 🧠 Neural Filter" if use_neural_filter else ""
@@ -428,6 +449,333 @@ class RSIStrategyBase:
         
         return signal, signal_strength
 
+    def calculate_stop_loss(self, entry_price, position, atr_value=None):
+        """🛡️ Вычисляем цену стоп-лосса с учетом S&R уровней"""
+        if not self.use_stop_loss:
+            return None
+        
+        # Базовый расчет стоп-лосса
+        if self.use_atr_stop and atr_value is not None:
+            # Адаптивный стоп на основе ATR
+            atr_distance = atr_value * self.atr_multiplier
+            
+            if position == 1:  # Лонг
+                base_stop = entry_price - atr_distance
+            else:  # Шорт
+                base_stop = entry_price + atr_distance
+        else:
+            # Фиксированный процентный стоп
+            if position == 1:  # Лонг
+                base_stop = entry_price * (1 - self.stop_loss_pct)
+            else:  # Шорт
+                base_stop = entry_price * (1 + self.stop_loss_pct)
+        
+        # 🎯 УМНЫЕ СТОП-ЛОССЫ: корректируем с учетом S&R уровней
+        if self.use_support_resistance and self.sr_levels:
+            adjusted_stop = self.adjust_stop_loss_for_sr(entry_price, base_stop, position)
+            return adjusted_stop
+        
+        return base_stop
+    
+    def adjust_stop_loss_for_sr(self, entry_price, base_stop, position):
+        """🎯 Корректируем стоп-лосс с учетом уровней S&R"""
+        try:
+            from support_resistance import SupportResistanceFinder
+            
+            if not hasattr(self, 'sr_finder'):
+                self.sr_finder = SupportResistanceFinder()
+            
+            if position == 1:  # Лонг позиция
+                # Ищем ближайший уровень поддержки ниже базового стопа
+                support_below = None
+                for level in self.sr_levels:
+                    if level['price'] < base_stop and level['type'] == 'support':
+                        if support_below is None or level['price'] > support_below['price']:
+                            support_below = level
+                
+                if support_below and support_below['strength'] >= 3:  # Только сильные уровни
+                    # Размещаем стоп чуть ниже уровня поддержки
+                    buffer = entry_price * 0.002  # 0.2% буфер
+                    adjusted_stop = support_below['price'] - buffer
+                    
+                    # Но не слишком далеко от базового стопа (максимум в 2 раза дальше)
+                    max_distance = abs(entry_price - base_stop) * 2
+                    if abs(entry_price - adjusted_stop) <= max_distance:
+                        print(f"🎯 Умный стоп лонг: {base_stop:.2f} -> {adjusted_stop:.2f} (за поддержкой {support_below['price']:.2f})")
+                        return adjusted_stop
+            
+            else:  # Шорт позиция
+                # Ищем ближайший уровень сопротивления выше базового стопа
+                resistance_above = None
+                for level in self.sr_levels:
+                    if level['price'] > base_stop and level['type'] == 'resistance':
+                        if resistance_above is None or level['price'] < resistance_above['price']:
+                            resistance_above = level
+                
+                if resistance_above and resistance_above['strength'] >= 3:  # Только сильные уровни
+                    # Размещаем стоп чуть выше уровня сопротивления
+                    buffer = entry_price * 0.002  # 0.2% буфер
+                    adjusted_stop = resistance_above['price'] + buffer
+                    
+                    # Но не слишком далеко от базового стопа
+                    max_distance = abs(entry_price - base_stop) * 2
+                    if abs(entry_price - adjusted_stop) <= max_distance:
+                        print(f"🎯 Умный стоп шорт: {base_stop:.2f} -> {adjusted_stop:.2f} (за сопротивлением {resistance_above['price']:.2f})")
+                        return adjusted_stop
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка корректировки стоп-лосса: {e}")
+        
+        # Возвращаем базовый стоп, если корректировка не удалась
+        return base_stop
+    
+    def analyze_trade_profitability(self, entry_price, signal):
+        """💰 Анализируем ожидаемую прибыльность сделки перед входом"""
+        try:
+            # Рассчитываем стоп-лосс для оценки риска
+            current_atr = self.atr_values[-1] if len(self.atr_values) > 0 else None
+            stop_loss_price = self.calculate_stop_loss(entry_price, signal, current_atr)
+            
+            if stop_loss_price is None:
+                # Если стоп-лосс отключен, используем фиксированный риск 2%
+                if signal == 1:  # Лонг
+                    stop_loss_price = entry_price * 0.98
+                else:  # Шорт
+                    stop_loss_price = entry_price * 1.02
+            
+            # Рассчитываем риск (расстояние до стоп-лосса)
+            risk_pct = abs(entry_price - stop_loss_price) / entry_price * 100
+            
+            # Оцениваем потенциальную цель на основе S&R уровней и технических индикаторов
+            target_price = self.estimate_target_price(entry_price, signal)
+            target_pct = abs(target_price - entry_price) / entry_price * 100
+            
+            # Рассчитываем соотношение риск/прибыль
+            risk_reward_ratio = target_pct / risk_pct if risk_pct > 0 else 0
+            
+            # Оцениваем вероятность успеха на основе технических факторов
+            success_probability = self.estimate_success_probability(entry_price, signal)
+            
+            # Ожидаемое значение сделки
+            expected_value = (success_probability * target_pct) - ((1 - success_probability) * risk_pct)
+            
+            return {
+                'entry_price': entry_price,
+                'stop_loss_price': stop_loss_price,
+                'target_price': target_price,
+                'risk_pct': risk_pct,
+                'target_pct': target_pct,
+                'risk_reward_ratio': risk_reward_ratio,
+                'success_probability': success_probability,
+                'expected_value': expected_value
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка анализа прибыльности: {e}")
+            # Возвращаем консервативную оценку
+            return {
+                'entry_price': entry_price,
+                'stop_loss_price': entry_price * (0.98 if signal == 1 else 1.02),
+                'target_price': entry_price * (1.03 if signal == 1 else 0.97),
+                'risk_pct': 2.0,
+                'target_pct': 3.0,
+                'risk_reward_ratio': 1.5,
+                'success_probability': 0.5,
+                'expected_value': 0.5
+            }
+    
+    def estimate_target_price(self, entry_price, signal):
+        """🎯 Оцениваем потенциальную цель сделки"""
+        try:
+            # Базовая цель на основе ATR
+            current_atr = self.atr_values[-1] if len(self.atr_values) > 0 else entry_price * 0.02
+            
+            if signal == 1:  # Лонг
+                base_target = entry_price + (current_atr * 2.5)
+            else:  # Шорт
+                base_target = entry_price - (current_atr * 2.5)
+            
+            # Корректируем цель на основе S&R уровней
+            if self.use_support_resistance and self.sr_levels:
+                sr_target = self.find_sr_target(entry_price, signal)
+                if sr_target:
+                    # Используем ближайший к базовой цели S&R уровень
+                    if abs(sr_target - entry_price) > abs(base_target - entry_price) * 0.5:
+                        return sr_target
+            
+            # Корректируем на основе Bollinger Bands
+            if len(self.bb_values) > 0:
+                bb_upper, bb_middle, bb_lower = self.bb_values[-1]
+                
+                if signal == 1 and bb_upper:  # Лонг - цель верхняя граница
+                    bb_target = bb_upper
+                    if bb_target > entry_price:
+                        return min(bb_target, base_target * 1.5)  # Не слишком жадно
+                
+                elif signal == -1 and bb_lower:  # Шорт - цель нижняя граница
+                    bb_target = bb_lower
+                    if bb_target < entry_price:
+                        return max(bb_target, base_target * 1.5)  # Не слишком жадно
+            
+            return base_target
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка оценки цели: {e}")
+            # Консервативная цель
+            return entry_price * (1.03 if signal == 1 else 0.97)
+    
+    def find_sr_target(self, entry_price, signal):
+        """🎯 Находим ближайший S&R уровень как цель"""
+        try:
+            if signal == 1:  # Лонг - ищем сопротивление выше
+                resistance_above = None
+                for level in self.sr_levels:
+                    if level['price'] > entry_price and level['type'] == 'resistance':
+                        if resistance_above is None or level['price'] < resistance_above['price']:
+                            resistance_above = level
+                
+                if resistance_above:
+                    return resistance_above['price'] * 0.999  # Чуть ниже сопротивления
+            
+            else:  # Шорт - ищем поддержку ниже
+                support_below = None
+                for level in self.sr_levels:
+                    if level['price'] < entry_price and level['type'] == 'support':
+                        if support_below is None or level['price'] > support_below['price']:
+                            support_below = level
+                
+                if support_below:
+                    return support_below['price'] * 1.001  # Чуть выше поддержки
+            
+            return None
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка поиска S&R цели: {e}")
+            return None
+    
+    def estimate_success_probability(self, entry_price, signal):
+        """📊 Оцениваем вероятность успеха сделки"""
+        try:
+            probability = 0.5  # Базовая вероятность
+            
+            # Корректируем на основе RSI
+            if len(self.rsi_values) > 0:
+                rsi = self.rsi_values[-1]
+                
+                if signal == 1:  # Лонг
+                    if rsi < 25:  # Очень перепродано
+                        probability += 0.2
+                    elif rsi < 30:  # Перепродано
+                        probability += 0.1
+                
+                elif signal == -1:  # Шорт
+                    if rsi > 75:  # Очень перекуплено
+                        probability += 0.2
+                    elif rsi > 70:  # Перекуплено
+                        probability += 0.1
+            
+            # Корректируем на основе силы S&R уровней
+            if self.use_support_resistance and self.sr_levels:
+                from support_resistance import SupportResistanceFinder
+                
+                if not hasattr(self, 'sr_finder'):
+                    self.sr_finder = SupportResistanceFinder()
+                
+                nearest_levels = self.sr_finder.get_nearest_levels(entry_price, self.sr_levels)
+                
+                if signal == 1 and nearest_levels['support']:  # Лонг рядом с поддержкой
+                    distance_pct = abs(entry_price - nearest_levels['support'].price) / entry_price * 100
+                    if distance_pct < 0.5:  # Очень близко к поддержке
+                        probability += 0.15
+                    elif distance_pct < 1.0:
+                        probability += 0.1
+                
+                elif signal == -1 and nearest_levels['resistance']:  # Шорт рядом с сопротивлением
+                    distance_pct = abs(nearest_levels['resistance'].price - entry_price) / entry_price * 100
+                    if distance_pct < 0.5:  # Очень близко к сопротивлению
+                        probability += 0.15
+                    elif distance_pct < 1.0:
+                        probability += 0.1
+            
+            # Ограничиваем вероятность разумными пределами
+            return max(0.2, min(0.8, probability))
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка оценки вероятности: {e}")
+            return 0.5
+    
+    def update_trailing_stop(self, current_price):
+        """🛡️ Обновляем трейлинг стоп"""
+        if not self.use_trailing_stop or self.position == 0:
+            return
+        
+        if self.position == 1:  # Лонг позиция
+            # Обновляем максимум
+            if self.trailing_high is None or current_price > self.trailing_high:
+                self.trailing_high = current_price
+                # Пересчитываем трейлинг стоп
+                new_stop = self.trailing_high * (1 - self.trailing_stop_pct)
+                # Стоп может только расти для лонга
+                if self.stop_loss_price is None or new_stop > self.stop_loss_price:
+                    self.stop_loss_price = new_stop
+        
+        elif self.position == -1:  # Шорт позиция
+            # Обновляем минимум
+            if self.trailing_low is None or current_price < self.trailing_low:
+                self.trailing_low = current_price
+                # Пересчитываем трейлинг стоп
+                new_stop = self.trailing_low * (1 + self.trailing_stop_pct)
+                # Стоп может только снижаться для шорта
+                if self.stop_loss_price is None or new_stop < self.stop_loss_price:
+                    self.stop_loss_price = new_stop
+    
+    def check_stop_loss(self, current_price, current_dt):
+        """🛡️ Проверяем срабатывание стоп-лосса"""
+        if not self.use_stop_loss or self.position == 0 or self.stop_loss_price is None:
+            return False
+        
+        stop_triggered = False
+        
+        if self.position == 1:  # Лонг позиция
+            if current_price <= self.stop_loss_price:
+                stop_triggered = True
+        elif self.position == -1:  # Шорт позиция
+            if current_price >= self.stop_loss_price:
+                stop_triggered = True
+        
+        if stop_triggered:
+            # Закрываем позицию по стоп-лоссу
+            self.exit_points.append((current_dt, current_price))
+            
+            # Сохраняем позицию ДО обнуления
+            old_position = self.position
+            
+            # Обновляем equity с учетом комиссии тейкера (стоп = маркет ордер)
+            if len(self.entry_points) > 0:
+                entry_price = self.entry_points[-1][1]
+                if old_position == 1:  # Был лонг
+                    pnl = (current_price - entry_price) / entry_price
+                else:  # Был шорт
+                    pnl = (entry_price - current_price) / entry_price
+                
+                # Вычитаем комиссии (вход + выход)
+                total_fee = self.maker_fee + self.taker_fee  # Вход лимит + выход маркет
+                pnl -= total_fee
+                
+                self.equity *= (1 + pnl)
+            
+            # Обнуляем позицию и стоп-лосс ПОСЛЕ расчета PnL
+            self.position = 0
+            self.entry_price = None
+            self.stop_loss_price = None
+            self.trailing_high = None
+            self.trailing_low = None
+            self.stop_loss_triggered += 1
+            
+            return True
+        
+        return False
+
     def check_pending_orders(self, current_price, current_dt):
         """🏭 Проверяем исполнение отложенных ордеров"""
         executed_orders = []
@@ -465,9 +813,24 @@ class RSIStrategyBase:
                 elif signal == 1:
                     # Открываем лонг
                     self.last_price = target_price
+                    self.entry_price = target_price
+                    self.entry_points.append((current_dt, target_price))  # 🎯 Фиксируем фактический вход
+                    # Устанавливаем стоп-лосс
+                    current_atr = self.atr_values[-1] if len(self.atr_values) > 0 else None
+                    self.stop_loss_price = self.calculate_stop_loss(target_price, 1, current_atr)
+                    self.trailing_high = target_price  # Инициализируем трейлинг
+                    self.trailing_low = None
+                    
                 elif signal == -1:
                     # Открываем шорт
                     self.last_price = target_price
+                    self.entry_price = target_price
+                    self.entry_points.append((current_dt, target_price))  # 🎯 Фиксируем фактический вход
+                    # Устанавливаем стоп-лосс
+                    current_atr = self.atr_values[-1] if len(self.atr_values) > 0 else None
+                    self.stop_loss_price = self.calculate_stop_loss(target_price, -1, current_atr)
+                    self.trailing_low = target_price  # Инициализируем трейлинг
+                    self.trailing_high = None
                 
                 self.position = signal
         
@@ -476,6 +839,14 @@ class RSIStrategyBase:
             del self.pending_orders[i]
     
     def on_tick(self, price, dt, volume=0):
+        # 🛡️ Проверяем стоп-лоссы ПЕРВЫМИ (приоритет!)
+        if self.check_stop_loss(price, dt):
+            # Если сработал стоп-лосс, пропускаем остальную логику
+            return
+        
+        # 🛡️ Обновляем трейлинг стоп
+        self.update_trailing_stop(price)
+        
         # 🏭 Проверяем исполнение отложенных ордеров
         self.check_pending_orders(price, dt)
         
@@ -581,7 +952,8 @@ class RSIStrategyBase:
         # Логика для лонгов (с нейронной фильтрацией)
         if rsi < self.rsi_buy and self.position == 0 and neural_approved:
             signal = 1  # открыть лонг
-            self.entry_points.append((candle_dt, candle_close))
+            # entry_points добавляется в check_pending_orders при исполнении ордера
+            
         elif self.position == 1:
             # 🎯 Выбор условия выхода из лонга
             if self.use_bb_exit:
@@ -596,11 +968,13 @@ class RSIStrategyBase:
                 if rsi > self.rsi_sell:
                     signal = 0  # закрыть лонг
                     self.exit_points.append((candle_dt, candle_close))
+                    
             
         # Логика для шортов (с нейронной фильтрацией)
         elif rsi > self.rsi_sell and self.position == 0 and neural_approved:
             signal = -1  # открыть шорт
-            self.entry_points.append((candle_dt, candle_close))
+            # entry_points добавляется в check_pending_orders при исполнении ордера
+            
         elif self.position == -1:
             # 🎯 Выбор условия выхода из шорта
             if self.use_bb_exit:
@@ -615,13 +989,44 @@ class RSIStrategyBase:
                 if rsi < self.rsi_buy:
                     signal = 0  # закрыть шорт
                     self.exit_points.append((candle_dt, candle_close))
+                    
         
         # 📊 Применяем модификацию сигналов на основе S&R
         if self.use_support_resistance and signal != self.position:
             signal, sr_strength = self.get_sr_signal_modifier(signal, price)
         
+        # 💰 ФИЛЬТР ПО ОЖИДАЕМОЙ ПРИБЫЛЬНОСТИ
+        if signal != self.position and signal != self.last_signal:
+            # Рассчитываем ожидаемую прибыльность перед входом
+            trade_analysis = self.analyze_trade_profitability(price, signal)
+            
+            # Фильтруем сделки с плохим соотношением риск/прибыль
+            if trade_analysis['risk_reward_ratio'] < 0.5:  # Минимум 1:0.5
+                if hasattr(self, 'verbose') and self.verbose:
+                    print(f"❌ Сделка отклонена: R/R {trade_analysis['risk_reward_ratio']:.2f} < 0.5")
+                return  # Пропускаем сделку
+            
+            if hasattr(self, 'verbose') and self.verbose:
+                print(f"✅ Сделка одобрена: R/R {trade_analysis['risk_reward_ratio']:.2f}, "
+                      f"риск {trade_analysis['risk_pct']:.2f}%, "
+                      f"цель {trade_analysis['target_pct']:.2f}%")
+        
         # 🏭 Создаем отложенные ордера ТОЛЬКО при изменении сигнала
         if signal != self.position and signal != self.last_signal:
+            # 📚 Записываем торговое решение ТОЛЬКО при реальном изменении сигнала
+            if self.collect_training_data and self.training_data_collector:
+                signal_type = 'hold'  # По умолчанию
+                if signal == 1 and self.position == 0:
+                    signal_type = 'buy'
+                elif signal == -1 and self.position == 0:
+                    signal_type = 'sell_short'
+                elif signal == 0 and self.position == 1:
+                    signal_type = 'sell'
+                elif signal == 0 and self.position == -1:
+                    signal_type = 'buy_cover'
+                
+                self.training_data_collector.record_trading_moment(self, signal_type, price, dt)
+            
             # Отменяем старые отложенные ордера (если есть)
             if self.pending_orders:
                 self.missed_orders += len(self.pending_orders)
@@ -737,6 +1142,10 @@ class RSIStrategyBase:
             'executed_orders': self.executed_orders,
             'missed_orders': self.missed_orders,
             'execution_rate_pct': execution_rate,
+            
+            # 🛡️ Статистика стоп-лоссов
+            'stop_loss_triggered': self.stop_loss_triggered,
+            'stop_loss_rate_pct': (self.stop_loss_triggered / len(self.entry_points) * 100) if len(self.entry_points) > 0 else 0,
         }
         
         if len(self.trades) > 0:
@@ -745,4 +1154,169 @@ class RSIStrategyBase:
             stats['total_fees_pct'] = total_fees * 100
             stats['avg_fee_per_trade_pct'] = (total_fees / len(self.trades)) * 100
         
-        return stats 
+        return stats
+    
+    def enable_training_data_collection(self, output_file=None):
+        """📚 Включает сбор данных для обучения нейронной сети"""
+        self.collect_training_data = True
+        self.training_data_collector = TrainingDataCollector(output_file)
+        print(f"📚 Сбор обучающих данных включен: {self.training_data_collector.output_file}")
+    
+    def save_training_data(self):
+        """💾 Сохраняет собранные данные для обучения"""
+        if self.training_data_collector:
+            return self.training_data_collector.save_data()
+        return None
+
+
+class TrainingDataCollector:
+    """📚 Собирает данные торговых моментов для обучения нейронной сети"""
+    
+    def __init__(self, output_file=None):
+        self.output_file = output_file or f"training_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        self.trading_moments = []
+        self.signal_counter = 0
+    
+    def record_trading_moment(self, strategy, signal_type, current_price, current_dt):
+        """📝 Записывает момент торгового решения"""
+        try:
+            # Проверяем что у нас достаточно данных
+            if len(strategy.candles) < 20 or len(strategy.rsi_values) < 20:
+                return
+            
+            # Извлекаем текущие признаки (как в нейронном фильтре)
+            lookback = min(20, len(strategy.rsi_values))
+            recent_rsi = strategy.rsi_values[-lookback:]
+            recent_bb = strategy.bb_values[-lookback:]
+            recent_atr = strategy.atr_values[-lookback:]
+            recent_vol_ratio = strategy.volatility_ratios[-lookback:]
+            recent_prices = [c.close for c in strategy.candles[-lookback:]]
+            
+            # Подготавливаем признаки через нейронный фильтр
+            if strategy.neural_filter:
+                features = strategy.neural_filter.prepare_features(
+                    recent_rsi, recent_bb, recent_atr, recent_vol_ratio, recent_prices
+                )
+            else:
+                # Базовые признаки если нет нейронного фильтра
+                features = self._prepare_basic_features(
+                    recent_rsi, recent_bb, recent_atr, recent_vol_ratio, recent_prices
+                )
+            
+            if features is None:
+                return
+            
+            # Сохраняем момент торгового решения
+            trading_moment = {
+                'timestamp': current_dt.isoformat(),
+                'signal_type': signal_type,  # 'buy', 'sell', 'hold'
+                'price': current_price,
+                'features': features.tolist() if hasattr(features, 'tolist') else list(features),
+                'rsi': recent_rsi[-1],
+                'position': strategy.position,
+                'candle_count': len(strategy.candles),
+                'signal_id': self.signal_counter
+            }
+            
+            # Добавляем информацию о S&R если доступно
+            if hasattr(strategy, 'sr_levels') and strategy.sr_levels:
+                try:
+                    from support_resistance import SupportResistanceFinder
+                    sr_finder = SupportResistanceFinder()
+                    nearest = sr_finder.get_nearest_levels(strategy.sr_levels, current_price)
+                    
+                    trading_moment['sr_info'] = {
+                        'nearest_support': nearest['support'].price if nearest['support'] else None,
+                        'nearest_resistance': nearest['resistance'].price if nearest['resistance'] else None,
+                        'support_strength': nearest['support'].strength if nearest['support'] else 0,
+                        'resistance_strength': nearest['resistance'].strength if nearest['resistance'] else 0,
+                    }
+                except Exception:
+                    pass
+            
+            self.trading_moments.append(trading_moment)
+            self.signal_counter += 1
+            
+            # Периодически выводим статистику
+            if self.signal_counter % 50 == 0:
+                print(f"📚 Собрано торговых моментов: {self.signal_counter}")
+                
+        except Exception as e:
+            print(f"⚠️ Ошибка записи торгового момента: {e}")
+    
+    def _prepare_basic_features(self, rsi_values, bb_values, atr_values, volatility_ratios, prices):
+        """📊 Подготавливает базовые признаки если нет нейронного фильтра"""
+        try:
+            import numpy as np
+            
+            features = []
+            
+            # RSI статистики
+            features.extend([
+                np.mean(rsi_values),
+                np.std(rsi_values), 
+                rsi_values[-1],
+                np.min(rsi_values),
+                np.max(rsi_values),
+            ])
+            
+            # Bollinger Bands позиции
+            bb_positions = []
+            for i, (ma, upper, lower) in enumerate(bb_values):
+                if ma and upper and lower:
+                    bb_pos = (prices[i] - lower) / (upper - lower) if upper != lower else 0.5
+                    bb_positions.append(bb_pos)
+                else:
+                    bb_positions.append(0.5)
+            
+            features.extend([
+                np.mean(bb_positions),
+                np.std(bb_positions),
+                bb_positions[-1],
+            ])
+            
+            # ATR и волатильность
+            features.extend([
+                np.mean(atr_values),
+                atr_values[-1],
+                np.mean(volatility_ratios),
+                volatility_ratios[-1],
+            ])
+            
+            # Ценовая динамика
+            price_changes = np.diff(prices)
+            features.extend([
+                np.mean(price_changes),
+                np.std(price_changes),
+                price_changes[-1] / prices[-2] if len(prices) > 1 else 0,
+            ])
+            
+            return np.array(features)
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка подготовки базовых признаков: {e}")
+            return None
+    
+    def save_data(self):
+        """💾 Сохраняет собранные данные в JSON файл"""
+        try:
+            import json
+            
+            data = {
+                'metadata': {
+                    'total_moments': len(self.trading_moments),
+                    'collection_time': datetime.now().isoformat(),
+                    'features_count': len(self.trading_moments[0]['features']) if self.trading_moments else 0
+                },
+                'trading_moments': self.trading_moments
+            }
+            
+            with open(self.output_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            print(f"💾 Сохранено {len(self.trading_moments)} торговых моментов в {self.output_file}")
+            return self.output_file
+            
+        except Exception as e:
+            print(f"❌ Ошибка сохранения данных: {e}")
+            return None 
