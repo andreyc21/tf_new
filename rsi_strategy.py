@@ -16,6 +16,7 @@ class Candle:
         self.low = None
         self.close = None
         self.volume = 0.0
+        self.tvol = 0
 
     def add_tick(self, price, volume):
         if self.open is None:
@@ -24,6 +25,7 @@ class Candle:
         self.low = price if self.low is None else min(self.low, price)
         self.close = price
         self.volume += volume
+        self.tvol += 1
 
     def to_tuple(self):
         return (self.start_time, self.open, self.high, self.low, self.close, self.volume)
@@ -125,16 +127,19 @@ def compute_atr_custom(candles, period=14):
         return 0.0
 
 def compute_atr(candles, period=14):
-    """🚀 ОПТИМИЗИРОВАННАЯ реализация ATR с кэшированием"""
+    """🚀 ОПТИМИЗИРОВАННАЯ реализация ATR с ограничением размера"""
     if len(candles) < period:
         return 0.0
         
     if TALIB_AVAILABLE:
         try:
-            # Подготавливаем данные для TA-Lib (оптимизированно)
-            highs = np.array([c.high for c in candles], dtype=np.float64)
-            lows = np.array([c.low for c in candles], dtype=np.float64)
-            closes = np.array([c.close for c in candles], dtype=np.float64)
+            # ⚡ ОПТИМИЗАЦИЯ: берем только последние свечи (максимум 100)
+            max_candles = min(100, len(candles))
+            recent_candles = candles[-max_candles:]
+            
+            highs = np.array([c.high for c in recent_candles], dtype=np.float64)
+            lows = np.array([c.low for c in recent_candles], dtype=np.float64)
+            closes = np.array([c.close for c in recent_candles], dtype=np.float64)
             
             atr_values = talib.ATR(highs, lows, closes, timeperiod=period)
             return atr_values[-1] if not np.isnan(atr_values[-1]) else 0.0
@@ -145,18 +150,21 @@ def compute_atr(candles, period=14):
 
 def compute_volatility_ratio(candles, atr_period=14, lookback=50):
     """🚀 ОПТИМИЗИРОВАННОЕ вычисление коэффициента волатильности"""
-    if len(candles) < lookback:
+    if len(candles) < atr_period:
         return 1.0
     
-    # Используем TA-Lib для вычисления всех ATR значений за один вызов
+    # Используем TA-Lib для вычисления ATR только на последних свечах
     if TALIB_AVAILABLE and len(candles) >= atr_period:
         try:
-            # Подготавливаем данные один раз
-            highs = np.array([c.high for c in candles], dtype=np.float64)
-            lows = np.array([c.low for c in candles], dtype=np.float64)
-            closes = np.array([c.close for c in candles], dtype=np.float64)
+            # ⚡ ОПТИМИЗАЦИЯ: берем только последние свечи для экономии памяти
+            max_needed = max(lookback + atr_period, 100)  # Максимум 100 свечей
+            recent_candles = candles[-min(max_needed, len(candles)):]
             
-            # Вычисляем все ATR значения за один вызов
+            highs = np.array([c.high for c in recent_candles], dtype=np.float64)
+            lows = np.array([c.low for c in recent_candles], dtype=np.float64)
+            closes = np.array([c.close for c in recent_candles], dtype=np.float64)
+            
+            # Вычисляем ATR только на нужном диапазоне
             all_atr = talib.ATR(highs, lows, closes, timeperiod=atr_period)
             
             # Фильтруем валидные значения
@@ -174,26 +182,11 @@ def compute_volatility_ratio(candles, atr_period=14, lookback=50):
             return current_atr / avg_atr if avg_atr > 0 else 1.0
             
         except Exception:
-            # Fallback к старой логике
+            # Fallback к упрощенной логике
             pass
     
-    # Fallback: старая логика (медленная)
-    current_atr = compute_atr(candles, atr_period)
-    
-    # Берем только последние значения вместо пересчета всех
-    start_idx = max(0, len(candles) - lookback)
-    atr_values = []
-    
-    for i in range(start_idx, len(candles), 5):  # Каждые 5 свечей вместо каждой
-        atr_val = compute_atr(candles[:i+1], atr_period)
-        if atr_val > 0:
-            atr_values.append(atr_val)
-    
-    if len(atr_values) == 0 or current_atr == 0:
-        return 1.0
-        
-    avg_atr = np.mean(atr_values)
-    return current_atr / avg_atr if avg_atr > 0 else 1.0
+    # Упрощенный fallback - просто возвращаем 1.0
+    return 1.0
 
 class RSIStrategyBase:
     def __init__(self, rsi_period=14, rsi_buy=30, rsi_sell=70, bb_period=20, bb_std=2, candle_minutes=5, 
@@ -201,7 +194,8 @@ class RSIStrategyBase:
                  neural_confidence_threshold=0.6, limit_order_offset=0.0001, maker_fee=0.0001, 
                  taker_fee=0.0005, use_bb_exit=False, use_support_resistance=False,
                  use_stop_loss=True, stop_loss_pct=0.02, use_trailing_stop=True, 
-                 trailing_stop_pct=0.015, use_atr_stop=True, atr_multiplier=2.0):  # 🏆 Реалистичные параметры для отложенных ордеров!
+                 trailing_stop_pct=0.015, use_atr_stop=True, atr_multiplier=2.0, 
+                 trade_logger=None):  # 🏆 Реалистичные параметры для отложенных ордеров!
         self.rsi_period = rsi_period
         self.rsi_buy = rsi_buy
         self.rsi_sell = rsi_sell
@@ -270,7 +264,8 @@ class RSIStrategyBase:
         self.sr_update_interval = 20        # Обновлять каждые N свечей
         
         self.entry_points = []  # (datetime, цена)
-        self.exit_points = []   # (datetime, цена)
+        self.exit_points = []   # (datetime, цена) - обычные выходы
+        self.stop_loss_points = []  # (datetime, цена) - сработавшие стоп-лоссы
         self.equity = 1.0
         self.equity_curve = []
         self.trades = []
@@ -294,6 +289,9 @@ class RSIStrategyBase:
         self.training_data_collector = None
         self.collect_training_data = False
         
+        # 📝 Логирование сделок
+        self.trade_logger = trade_logger  # Callback функция для логирования сделок
+        
         # Информация о используемых индикаторах
         neural_info = " + 🧠 Neural Filter" if use_neural_filter else ""
         atr_type = "TA-Lib" if TALIB_AVAILABLE else "Custom"
@@ -312,6 +310,22 @@ class RSIStrategyBase:
                             microseconds=dt.microsecond)
         return dt - discard
     
+    def log_trade(self, trade_type, price, dt, **kwargs):
+        """📝 Логирует торговую сделку через callback"""
+        if self.trade_logger:
+            trade_info = {
+                'timestamp': dt.isoformat(),
+                'type': trade_type,  # 'open_long', 'close_long', 'open_short', 'close_short', 'stop_loss'
+                'price': price,
+                'equity': self.equity,
+                'position': self.position,
+                'rsi': self.rsi_values[-1] if self.rsi_values else None,
+                'bb_ma': self.bb_values[-1][0] if self.bb_values else None,
+                'atr': self.atr_values[-1] if self.atr_values else None,
+                **kwargs  # Дополнительные параметры (PnL, stop_loss_price и т.д.)
+            }
+            self.trade_logger(trade_info)
+    
     def get_cached_arrays(self):
         """🚀 Получить кэшированные numpy массивы"""
         current_length = len(self.candles)
@@ -323,11 +337,14 @@ class RSIStrategyBase:
             current_length > 0):
             return cache['highs'], cache['lows'], cache['closes']
         
-        # Обновляем кэш
+        # Обновляем кэш - берем только последние 200 свечей для экономии памяти
         if current_length > 0:
-            cache['highs'] = np.array([c.high for c in self.candles], dtype=np.float64)
-            cache['lows'] = np.array([c.low for c in self.candles], dtype=np.float64)  
-            cache['closes'] = np.array([c.close for c in self.candles], dtype=np.float64)
+            max_cache_size = 200
+            recent_candles = self.candles[-min(max_cache_size, current_length):]
+            
+            cache['highs'] = np.array([c.high for c in recent_candles], dtype=np.float64)
+            cache['lows'] = np.array([c.low for c in recent_candles], dtype=np.float64)  
+            cache['closes'] = np.array([c.close for c in recent_candles], dtype=np.float64)
             cache['last_length'] = current_length
             
             return cache['highs'], cache['lows'], cache['closes']
@@ -744,8 +761,8 @@ class RSIStrategyBase:
                 stop_triggered = True
         
         if stop_triggered:
-            # Закрываем позицию по стоп-лоссу
-            self.exit_points.append((current_dt, current_price))
+            # Закрываем позицию по стоп-лоссу (добавляем в отдельный список!)
+            self.stop_loss_points.append((current_dt, current_price))
             
             # Сохраняем позицию ДО обнуления
             old_position = self.position
@@ -763,6 +780,11 @@ class RSIStrategyBase:
                 pnl -= total_fee
                 
                 self.equity *= (1 + pnl)
+                
+                # 📝 Логируем стоп-лосс
+                self.log_trade('stop_loss', current_price, current_dt, 
+                              old_position=old_position, pnl=pnl, 
+                              entry_price=entry_price, reason='stop_loss_triggered')
             
             # Обнуляем позицию и стоп-лосс ПОСЛЕ расчета PnL
             self.position = 0
@@ -803,12 +825,22 @@ class RSIStrategyBase:
                     self.equity *= (1 + net_pnl)
                     self.trades.append(self.equity)
                     
+                    # 📝 Логируем закрытие лонга
+                    self.log_trade('close_long', target_price, current_dt, 
+                                  pnl=net_pnl, entry_price=self.last_price, 
+                                  reason='limit_order_executed')
+                    
                 elif self.position == -1 and signal == 0:
                     # Закрываем шорт
                     pnl_before_fees = (self.last_price - target_price) / self.last_price
                     net_pnl = pnl_before_fees - self.maker_fee
                     self.equity *= (1 + net_pnl)
                     self.trades.append(self.equity)
+                    
+                    # 📝 Логируем закрытие шорта
+                    self.log_trade('close_short', target_price, current_dt, 
+                                  pnl=net_pnl, entry_price=self.last_price, 
+                                  reason='limit_order_executed')
                 
                 elif signal == 1:
                     # Открываем лонг
@@ -821,6 +853,11 @@ class RSIStrategyBase:
                     self.trailing_high = target_price  # Инициализируем трейлинг
                     self.trailing_low = None
                     
+                    # 📝 Логируем открытие лонга
+                    self.log_trade('open_long', target_price, current_dt, 
+                                  stop_loss_price=self.stop_loss_price, 
+                                  reason='limit_order_executed')
+                    
                 elif signal == -1:
                     # Открываем шорт
                     self.last_price = target_price
@@ -831,6 +868,11 @@ class RSIStrategyBase:
                     self.stop_loss_price = self.calculate_stop_loss(target_price, -1, current_atr)
                     self.trailing_low = target_price  # Инициализируем трейлинг
                     self.trailing_high = None
+                    
+                    # 📝 Логируем открытие шорта
+                    self.log_trade('open_short', target_price, current_dt, 
+                                  stop_loss_price=self.stop_loss_price, 
+                                  reason='limit_order_executed')
                 
                 self.position = signal
         
@@ -862,52 +904,68 @@ class RSIStrategyBase:
             self.current_candle_time = candle_time
         self.current_candle.add_tick(price, volume)
         
-        # --- Оптимизированный расчет индикаторов ---
+        # --- ⚡ ОПТИМИЗИРОВАННЫЙ расчет индикаторов для каждого тика ---
         current_candle_count = len(self.candles)
         
         # Обновляем кэшированный массив closes только при необходимости
         if candle_closed or current_candle_count != self.last_candle_count:
-            self.cached_closes = [c.close for c in self.candles]
+            # ⚡ ОПТИМИЗАЦИЯ: кэшируем только последние 200 свечей для экономии памяти
+            max_cache_closes = 200
+            recent_candles = self.candles[-min(max_cache_closes, len(self.candles)):]
+            self.cached_closes = [c.close for c in recent_candles]
             self.last_candle_count = current_candle_count
         
-        # Добавляем текущую цену для расчетов
-        closes_with_current = self.cached_closes + [self.current_candle.close]
-        
-        # 🏆 ОПТИМИЗИРОВАННАЯ СТРАТЕГИЯ:
-        # - RSI: используем нашу выигрышную кастомную реализацию (SMA-based)  
-        # - Bollinger Bands: используем TA-Lib (быстрее, результат тот же)
-        
-        if self.use_custom_rsi:
-            # Используем только кастомный RSI (выигрышная стратегия!)
-            rsi = compute_rsi_custom(closes_with_current, period=self.rsi_period)
-            rsi_custom = rsi  # Для совместимости
-        elif self.use_dual_rsi:
-            # Используем оба варианта RSI для сравнения
-            rsi = compute_rsi(closes_with_current, period=self.rsi_period)  # TA-Lib
-            rsi_custom = compute_rsi_custom(closes_with_current, period=self.rsi_period)  # Кастомный
+        # ⚡ ВАЖНО: Вычисляем индикаторы для КАЖДОГО ТИКА (для точности торговых решений)
+        # ⚡ ОПТИМИЗАЦИЯ: избегаем создания нового списка каждый раз
+        if hasattr(self, '_temp_closes_with_current'):
+            if candle_closed or len(self._temp_closes_with_current) != len(self.cached_closes) + 1:
+                # Пересоздаем список при закрытии свечи
+                self._temp_closes_with_current = self.cached_closes + [self.current_candle.close]
+            else:
+                # Обновляем только последний элемент (текущую цену)
+                self._temp_closes_with_current[-1] = self.current_candle.close
         else:
-            # Fallback к стандартному RSI (TA-Lib или кастомный)
-            rsi = compute_rsi(closes_with_current, period=self.rsi_period)
-            rsi_custom = rsi  # Для совместимости
+            # Первая инициализация
+            self._temp_closes_with_current = self.cached_closes + [self.current_candle.close]
         
-        # Bollinger Bands всегда через TA-Lib (если доступен) - быстрее и результат тот же
+        closes_with_current = self._temp_closes_with_current
+        
+        # 🏆 Расчет индикаторов для текущего тика
+        if self.use_custom_rsi:
+            rsi = compute_rsi_custom(closes_with_current, period=self.rsi_period)
+            rsi_custom = rsi
+        elif self.use_dual_rsi:
+            rsi = compute_rsi(closes_with_current, period=self.rsi_period)
+            rsi_custom = compute_rsi_custom(closes_with_current, period=self.rsi_period)
+        else:
+            rsi = compute_rsi(closes_with_current, period=self.rsi_period)
+            rsi_custom = rsi
+        
+        # Bollinger Bands для текущего тика
         ma, upper, lower = compute_bollinger_bands(closes_with_current, period=self.bb_period, num_std=self.bb_std)
         
-        # 📊 Вычисляем индикаторы волатильности (оптимизированно)
-        candles_with_current = self.candles + [self.current_candle]
-        atr = compute_atr(candles_with_current, period=14)
-        volatility_ratio = compute_volatility_ratio(candles_with_current, atr_period=14, lookback=50)
+        # ATR и волатильность (оптимизируем создание списков)
+        # ⚡ ОПТИМИЗАЦИЯ: избегаем создания нового списка каждый раз
+        if hasattr(self, '_temp_candles_for_atr'):
+            # Обновляем временный список только при необходимости
+            if candle_closed or len(self._temp_candles_for_atr) != len(self.candles) + 1:
+                max_atr_candles = 100
+                recent_candles = self.candles[-min(max_atr_candles, len(self.candles)):]
+                self._temp_candles_for_atr = recent_candles + [self.current_candle]
+            else:
+                # Обновляем только последний элемент (текущую свечу)
+                self._temp_candles_for_atr[-1] = self.current_candle
+        else:
+            # Первая инициализация
+            max_atr_candles = 100
+            recent_candles = self.candles[-min(max_atr_candles, len(self.candles)):]
+            self._temp_candles_for_atr = recent_candles + [self.current_candle]
+        
+        atr = compute_atr(self._temp_candles_for_atr, period=14)
+        volatility_ratio = compute_volatility_ratio(self._temp_candles_for_atr, atr_period=14, lookback=50)
         
         # Сохраняем значения только при закрытии свечи
         if candle_closed:
-            self.rsi_values.append(rsi)
-            self.bb_values.append((ma, upper, lower))
-            self.atr_values.append(atr)
-            self.volatility_ratios.append(volatility_ratio)
-            if self.use_dual_rsi:
-                self.rsi_custom_values.append(rsi_custom)
-        elif len(self.rsi_values) == len(self.candles):
-            # Для текущей свечи - обновляем последнее значение
             self.rsi_values.append(rsi)
             self.bb_values.append((ma, upper, lower))
             self.atr_values.append(atr)
@@ -1075,7 +1133,10 @@ class RSIStrategyBase:
             self.candles.append(self.current_candle)
             
             # Добавляем финальные RSI/BB значения для последней свечи
-            closes = [c.close for c in self.candles]
+            # ⚡ ОПТИМИЗАЦИЯ: используем только последние свечи для финального расчета
+            max_final_candles = 100
+            recent_candles = self.candles[-min(max_final_candles, len(self.candles)):]
+            closes = [c.close for c in recent_candles]
             
             # Вычисляем финальные значения индикаторов (используем ту же логику что и в on_tick)
             if self.use_custom_rsi:
